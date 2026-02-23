@@ -21,20 +21,10 @@ make
 - There are two endpoints available at `/` and `/hello.html` which are created for demo purpose.
 - In order to have multiple concurrent connections, make sure to raise the resource limit (with `ulimit`) before running the server. A non-root user by default can have about 1000 file descriptors opened, which corresponds to 1000 active clients.
 
+
 ## Benchmark
 
-I used a tool called [wrk](https://github.com/wg/wrk) to benchmark this HTTP server. The tests were performed on my laptop with the following specs:
-
-```bash
-Model: Thinkpad T480
-OS: Ubuntu 18.04 TLS x84_64
-Kernel: 4.18.0-24-generic
-CPU: Intel i7-8550 (8) @ 4.000 GHz
-GPU: Intel UHD Graphics 620
-Memory: 6010 MiB / 15803 MiB
-```
-
-Here are the results for two test runs. Each test ran for 1 minute, with 10 client threads. The first test had only 500 concurrent connections, while the second test had 10000.
+- Epoll implementation:
 
 ```bash
 $ ./wrk -t10 -c500 -d60s http://0.0.0.0:8080/
@@ -61,3 +51,33 @@ Transfer/sec:      6.41MB
 
 ```
 
+## Need to improve
+
+- So currently my code cannot run even with -c500
+- Safe pattern:
+
+```cpp
+while (running) {
+
+    // Try to submit as much as possible
+    int ret = io_uring_submit(&ring);
+    if (ret < 0) {
+        perror("submit");
+        break;
+    }
+
+    // Block until at least 1 completion
+    io_uring_cqe* cqe;
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        perror("wait_cqe");
+        break;
+    }
+
+    // Drain all completions
+    do {
+        handle_completion(cqe);
+        io_uring_cqe_seen(&ring, cqe);
+    } while (!io_uring_peek_cqe(&ring, &cqe));
+}
+```
