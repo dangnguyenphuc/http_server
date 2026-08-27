@@ -1,6 +1,6 @@
 #!/bin/bash
 
-URL="http://127.0.0.1:8080/"
+URL="http://127.0.0.1:21121/"
 
 run () {
     echo "====== $1 requests ======"

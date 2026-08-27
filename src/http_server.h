@@ -8,13 +8,15 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
-#include <chrono>
+#include <atomic>
 #include <functional>
 #include <map>
-#include <random>
 #include <string>
 #include <thread>
 #include <utility>
+#include <deque>
+#include <mutex>
+#include <vector>
 
 #include "http_message.h"
 #include "uri.h"
@@ -26,6 +28,8 @@ namespace simple_http_server {
 constexpr size_t kMaxBufferSize = 4096;
 
 enum class EventType {
+  ACCEPT,
+  NOTIFY,
   READ, 
   WRITE
 };
@@ -37,6 +41,8 @@ struct EventData {
   size_t length;
   size_t cursor;
   char buffer[kMaxBufferSize];
+
+  uint64_t notify_value;
 };
 
 // A request handler should expect a request as argument and returns a response
@@ -75,14 +81,16 @@ class HttpServer {
   std::string host_;
   std::uint16_t port_;
   int sock_fd_;
-  bool running_;
-  std::thread listener_thread_;
+  std::atomic<bool> running_;
+  std::thread listen_thread_;
   std::thread worker_threads_[kThreadPoolSize];
   struct io_uring worker_ring_[kThreadPoolSize];
+  struct io_uring listen_ring_{};
+  std::mutex worker_mutex_[kThreadPoolSize];
+  std::vector<std::deque<int>> worker_pending_fds_;
+  std::vector<int> worker_event_fd_;
 
   std::map<Uri, std::map<HttpMethod, HttpRequestHandler_t>> request_handlers_;
-  std::mt19937 rng_;
-  std::uniform_int_distribution<int> sleep_times_;
 
   void CreateSocket();
   void SetUpRings();
@@ -90,13 +98,23 @@ class HttpServer {
   void ProcessEvents(int worker_id);
 
   // Helper to push new async requests to the ring
-  void SubmitReadRequest(int worker_id, int client_fd);
-  void SubmitWriteRequest(int worker_id, EventData* data);
+  void SubmitAccept();
+  void DispatchConnection(int worker_id, int fd);
+  void SubmitWorkerNotify(int worker_id);
+  void SubmitRecvRequest(int worker_id, EventData* data);
+  void SubmitSendRequest(int worker_id, EventData* data);
+  void HandleNotify(int worker_id);
+  void HandleRecv(int worker_id, int res, EventData* data);
+  void HandleSend(int worker_id, int res, EventData* data);
 
-  void HandleURingEvent(int worker_id, EventData* data);
-  void HandleHttpData(const EventData& request, EventData* response);
+  void HandleURingEvent(int worker_id, int res, EventData* data);
+  // Returns false if it already closed/deleted `request` (e.g. oversized
+  // response) — the caller must not touch it again in that case.
+  bool HandleHttpData(EventData* request);
   HttpResponse HandleHttpRequest(const HttpRequest& request);
 
+  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, EventData* data);
+  struct io_uring_sqe* GetListenIouringSqe(EventData* data);
 };
 
 }  // namespace simple_http_server

@@ -4,21 +4,18 @@
 #include <liburing.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include <cerrno>
-#include <chrono>
 #include <cstring>
-#include <functional>
-#include <map>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 
 #include "http_message.h"
 #include "uri.h"
 
-#include <iostream> // delete this shit
+#include <iostream>
 
 namespace simple_http_server {
 
@@ -27,165 +24,306 @@ HttpServer::HttpServer(const std::string &host, std::uint16_t port)
       port_(port),
       sock_fd_(0),
       running_(false),
-      worker_ring_(),
-      rng_(std::chrono::steady_clock::now().time_since_epoch().count()),
-      sleep_times_(10, 100) {
+      worker_ring_() {
   CreateSocket();
+  worker_event_fd_.resize(kThreadPoolSize);
+  worker_pending_fds_.resize(kThreadPoolSize);
+  std::fill(worker_event_fd_.begin(), worker_event_fd_.end(), -1);
 }
 
 void HttpServer::Start() {
-  int opt = 1;
-  sockaddr_in server_address;
-
-  if (setsockopt(sock_fd_, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt,
-                 sizeof(opt)) < 0) {
-    throw std::runtime_error("Failed to set socket options");
-  }
-
-  server_address.sin_family = AF_INET;
-  server_address.sin_addr.s_addr = INADDR_ANY;
-  inet_pton(AF_INET, host_.c_str(), &(server_address.sin_addr.s_addr));
-  server_address.sin_port = htons(port_);
-
-  if (bind(sock_fd_, (sockaddr *)&server_address, sizeof(server_address)) < 0) {
-    throw std::runtime_error("Failed to bind to socket");
-  }
-
-  if (listen(sock_fd_, kBacklogSize) < 0) {
-    std::ostringstream msg;
-    msg << "Failed to listen on port " << port_;
-    throw std::runtime_error(msg.str());
-  }
-
-  SetUpRings();
   running_ = true;
-  listener_thread_ = std::thread(&HttpServer::Listen, this);
-  for (int i = 0; i < kThreadPoolSize; i++) {
-    worker_threads_[i] = std::thread(&HttpServer::ProcessEvents, this, i);
-  }
+  SetUpRings();
+  listen_thread_ = std::thread(&HttpServer::Listen, this);
 }
 
 void HttpServer::CreateSocket() {
-  if ((sock_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) < 0) {
-    throw std::runtime_error("Failed to create a TCP socket");
-  }
+
+  sock_fd_ = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0);
+
+    if (sock_fd_ < 0) {
+      throw std::runtime_error("Failed to create a TCP socket");
+    }
+
+    int yes = 1;
+
+    setsockopt(
+        sock_fd_,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &yes,
+        sizeof(yes));
+
+    sockaddr_in addr{};
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port_);
+
+    if (bind(
+            sock_fd_,
+            reinterpret_cast<sockaddr*>(&addr),
+            sizeof(addr)) < 0) {
+      throw std::runtime_error("Failed to bind socket");
+    }
+
+    if (listen(sock_fd_, 1024) < 0) {
+      throw std::runtime_error("Failed to listen socket");
+    }
 }
 
 void HttpServer::SetUpRings() {
+  if (io_uring_queue_init(kQueueDepth, &listen_ring_, 0) < 0) {
+      throw std::runtime_error("Failed to initialize io_uring for worker");
+  }
   for (int i = 0; i < kThreadPoolSize; i++) {
     if (io_uring_queue_init(kQueueDepth, &worker_ring_[i], 0) < 0) {
       throw std::runtime_error("Failed to initialize io_uring for worker");
     }
+
+    worker_event_fd_[i] = eventfd(0, EFD_CLOEXEC);
+    if (worker_event_fd_[i] < 0) {
+      throw std::runtime_error("Failed to event fd for worker");
+    }
+    worker_threads_[i] = std::thread(&HttpServer::ProcessEvents, this, i);
   }
 }
 
 void HttpServer::Stop() {
   running_ = false;
-  listener_thread_.join();
-  for (int i = 0; i < kThreadPoolSize; i++) {
+  // Wake listener.
+  shutdown(sock_fd_, SHUT_RDWR);
+
+  // Wake workers.
+  for (int i = 0; i < kThreadPoolSize; ++i) {
+    uint64_t one = 1;
+    write(worker_event_fd_[i], &one, sizeof(one));
+  }
+
+  listen_thread_.join();
+
+  for (int i = 0; i < kThreadPoolSize; ++i) {
     worker_threads_[i].join();
   }
-  for (int i = 0; i < kThreadPoolSize; i++) {
+
+  io_uring_queue_exit(&listen_ring_);
+
+  for (int i = 0; i < kThreadPoolSize; ++i) {
     io_uring_queue_exit(&worker_ring_[i]);
   }
+
   close(sock_fd_);
 }
 
 void HttpServer::Listen() {
-  sockaddr_in client_address;
-  socklen_t client_len = sizeof(client_address);
-  int client_fd;
   int current_worker = 0;
-  bool active = true;
-
-  // accept new connections and distribute tasks to worker threads
+  SubmitAccept();
+  io_uring_submit(&listen_ring_);
   while (running_) {
-    if (!active) {
-      std::this_thread::sleep_for(
-          std::chrono::microseconds(sleep_times_(rng_)));
-    }
-    client_fd = accept4(sock_fd_, (sockaddr *)&client_address, &client_len,
-                        SOCK_NONBLOCK);
-    if (client_fd < 0) {
-      active = false;
+    struct io_uring_cqe* cqe = nullptr;
+    int ret = io_uring_wait_cqe(
+          &listen_ring_,
+          &cqe);
+    if (ret < 0) {
+      fprintf(
+          stderr,
+          "listen wait_cqe: %s\n",
+          strerror(-ret));
       continue;
     }
 
-    active = true;
-    SubmitReadRequest(current_worker, client_fd);
-    current_worker = (current_worker + 1) % kThreadPoolSize;;
+    auto* data = reinterpret_cast<EventData*>(cqe->user_data);
+    int result = cqe->res;
+    if (data->type == EventType::ACCEPT) {
+      if (result >= 0) {
+        int client_fd = result;
+        DispatchConnection(current_worker, client_fd);
+        current_worker = (current_worker + 1) % kThreadPoolSize;
+      } else {
+        fprintf(
+            stderr,
+            "accept: %s\n",
+            strerror(-result));
+      }
+      SubmitAccept();
+    }
+    delete data;
+    io_uring_cqe_seen(&listen_ring_, cqe);
+    io_uring_submit(&listen_ring_);
   }
 }
 
-void HttpServer::SubmitReadRequest(int worker_id, int client_fd) {
-  struct io_uring_sqe* sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
-  EventData* data = new EventData();
-  data->fd = client_fd;
-  data->type = EventType::READ;
-
-  io_uring_prep_recv(sqe, client_fd, data->buffer, kMaxBufferSize, 0);
+void HttpServer::SubmitAccept() {
+  auto* data = new EventData();
+  struct io_uring_sqe* sqe = GetListenIouringSqe(data);
+  data->type = EventType::ACCEPT;
+  io_uring_prep_accept(sqe, sock_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
   io_uring_sqe_set_data(sqe, data);
-  io_uring_submit(&worker_ring_[worker_id]);
 }
 
-void HttpServer::SubmitWriteRequest(int worker_id, EventData* data) {
-  struct io_uring_sqe *sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
-  io_uring_prep_send(sqe, data->fd, data->buffer, data->length, 0);
+void HttpServer::DispatchConnection(int worker_id, int fd) {
+  {
+    std::lock_guard<std::mutex> lock(worker_mutex_[worker_id]);
+    worker_pending_fds_[worker_id].push_back(fd);
+  }
+  /*
+  * Wake worker.
+  */
+  uint64_t one = 1;
+
+  ssize_t n = write(worker_event_fd_[worker_id], &one, sizeof(one));
+  if (n != sizeof(one)) {
+    close(fd);
+    throw std::runtime_error("Cannot write to event_fd");
+  }
+}
+
+void HttpServer::SubmitWorkerNotify(int worker_id) {
+  auto* data = new EventData();
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
+  data->type = EventType::NOTIFY;
+  data->notify_value = 0;
+
+  io_uring_prep_read(
+      sqe,
+      worker_event_fd_[worker_id],
+      &data->notify_value,
+      sizeof(data->notify_value),
+      0);
+
+    sqe->user_data = reinterpret_cast<uint64_t>(data);
+}
+
+void HttpServer::SubmitRecvRequest(int worker_id, EventData* data) {
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
+  // todo: here
+  data->type = EventType::READ;
+  io_uring_prep_recv(sqe, data->fd, data->buffer, kMaxBufferSize - 1, 0);
   io_uring_sqe_set_data(sqe, data);
-  io_uring_submit(&worker_ring_[worker_id]);
+}
+
+void HttpServer::SubmitSendRequest(int worker_id, EventData* data) {
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
+  // todo: here
+  data->type = EventType::WRITE;
+  size_t remaining = data->length - data->cursor;
+  io_uring_prep_send(sqe, data->fd, data->buffer + data->cursor, remaining, 0);
+  io_uring_sqe_set_data(sqe, data);
+}
+
+void HttpServer::HandleNotify(int worker_id) {
+  for (;;) {
+    int client_fd = -1;
+    if (io_uring_sq_space_left(&worker_ring_[worker_id]) <= 0) break;
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_[worker_id]);
+      std::deque<int>& pending_fds = worker_pending_fds_[worker_id];
+      if(pending_fds.empty()) {
+        break;
+      }
+      client_fd = pending_fds.front();
+      pending_fds.pop_front();
+    }
+
+    auto* data = new EventData();
+    data->fd = client_fd;
+    printf("worker %d: new fd=%d\n", worker_id, client_fd);
+    SubmitRecvRequest(worker_id, data);
+  }
+}
+
+void HttpServer::HandleRecv(int worker_id, int res, EventData* data) {
+  if (res <= 0) {
+    close(data->fd);
+    delete data;
+    return;
+  }
+
+  data->buffer[res] = '\0';
+  printf("worker %d fd=%d request:\n%s\n",
+      worker_id,
+      data->fd,
+      data->buffer);
+
+  if (!HandleHttpData(data)) {
+    return;
+  }
+  SubmitSendRequest(worker_id, data);
+}
+
+void HttpServer::HandleSend(int worker_id, int res, EventData* data) {
+  if (res < 0) {
+    close(data->fd);
+    delete data;
+    return;
+  }
+
+  data->cursor += static_cast<size_t>(res);
+
+  if (data->cursor < data->length) {
+    SubmitSendRequest(worker_id, data);
+    return;
+  }
+
+  close(data->fd);
+  delete data;
 }
 
 void HttpServer::ProcessEvents(int worker_id) {
-  struct io_uring_cqe* cqe;
   struct io_uring* ring = &worker_ring_[worker_id];
-  
-  bool active = true;
-
+  SubmitWorkerNotify(worker_id);
+  io_uring_submit(ring);
   while (running_) {
-    if (!active) {
-      std::this_thread::sleep_for(
-          std::chrono::microseconds(sleep_times_(rng_)));
-    }
+    struct io_uring_cqe* cqe = nullptr;
     int ret = io_uring_wait_cqe(ring, &cqe);
     if (ret < 0) {
-      active = false;
+      fprintf(
+          stderr,
+          "worker %d wait: %s\n",
+          worker_id,
+          strerror(-ret)
+      );
+
       continue;
     }
 
-    active = true;
-
     EventData* data = reinterpret_cast<EventData *>(io_uring_cqe_get_data(cqe));
     int res = cqe->res;
-
-    if(res <= 0) {
-      close(data->fd);
-      delete data;
-    } else {
-      HandleURingEvent(worker_id, data);
-    }
-
+    HandleURingEvent(worker_id, res, data);
     io_uring_cqe_seen(ring, cqe);
+    // Retry draining any fds that a previous NOTIFY couldn't fit into the
+    // submission queue; submit() below just freed that space back up.
+    HandleNotify(worker_id);
+    io_uring_submit(ring);
   }
 }
 
-void HttpServer::HandleURingEvent(int worker_id, EventData *data) {
-  if(data->type == EventType::READ) {
-    EventData *response = new EventData();
-    response->fd = data->fd;
-    response->type = EventType::WRITE;
-
-    HandleHttpData(*data, response);
-    SubmitWriteRequest(worker_id, response);
-    delete data;
-  } else if (data->type == EventType::WRITE) {
-    close(data->fd);
-    delete data;
+void HttpServer::HandleURingEvent(int worker_id, int res, EventData *data) {
+  switch (data->type)
+  {
+    case EventType::NOTIFY:
+      // Re-arm the eventfd read first so it always gets a slot, even if
+      // draining below fills the rest of the submission queue.
+      SubmitWorkerNotify(worker_id);
+      if (res >= 0) {
+        HandleNotify(worker_id);
+      }
+      delete data;
+      break;
+    case EventType::READ:
+      HandleRecv(worker_id, res, data);
+      break;
+    case EventType::WRITE:
+      HandleSend(worker_id, res, data);
+      break;
   }
 }
 
-void HttpServer::HandleHttpData(const EventData &raw_request,
-                                EventData *raw_response) {
-  std::string request_string(raw_request.buffer), response_string;
+bool HttpServer::HandleHttpData(EventData* raw_request) {
+  std::string request_string(raw_request->buffer), response_string;
   HttpRequest http_request;
   HttpResponse http_response;
 
@@ -208,8 +346,16 @@ void HttpServer::HandleHttpData(const EventData &raw_request,
   // Set response to write to client
   response_string =
       to_string(http_response, http_request.method() != HttpMethod::HEAD);
-  memcpy(raw_response->buffer, response_string.c_str(), kMaxBufferSize);
-  raw_response->length = response_string.length();
+  if (response_string.size() >= kMaxBufferSize) {
+    close(raw_request->fd);
+    delete raw_request;
+    return false;
+  }
+  std::strncpy(raw_request->buffer, response_string.c_str(), sizeof(char)*kMaxBufferSize - 1);
+  raw_request->buffer[kMaxBufferSize - 1] = '\0';
+  raw_request->length = response_string.length();
+  raw_request->cursor = 0;
+  return true;
 }
 
 HttpResponse HttpServer::HandleHttpRequest(const HttpRequest &request) {
@@ -222,6 +368,24 @@ HttpResponse HttpServer::HandleHttpRequest(const HttpRequest &request) {
     return HttpResponse(HttpStatusCode::MethodNotAllowed);
   }
   return callback_it->second(request);  // call handler to process the request
+}
+
+struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, EventData* data) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
+  if (!sqe) {
+    delete data;
+    throw std::runtime_error("Failed to get sqe of worker_ring");
+  }
+  return sqe;
+}
+
+struct io_uring_sqe* HttpServer::GetListenIouringSqe(EventData* data) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&listen_ring_);
+  if (!sqe) {
+    delete data;
+    throw std::runtime_error("Failed to get sqe of listen_ring");
+  }
+  return sqe;
 }
 
 }  // namespace simple_http_server

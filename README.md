@@ -50,34 +50,3 @@ Requests/sec:  86123.84
 Transfer/sec:      6.41MB
 
 ```
-
-## Need to improve
-
-- So currently my code cannot run even with -c500
-- Safe pattern:
-
-```cpp
-while (running) {
-
-    // Try to submit as much as possible
-    int ret = io_uring_submit(&ring);
-    if (ret < 0) {
-        perror("submit");
-        break;
-    }
-
-    // Block until at least 1 completion
-    io_uring_cqe* cqe;
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-        perror("wait_cqe");
-        break;
-    }
-
-    // Drain all completions
-    do {
-        handle_completion(cqe);
-        io_uring_cqe_seen(&ring, cqe);
-    } while (!io_uring_peek_cqe(&ring, &cqe));
-}
-```
