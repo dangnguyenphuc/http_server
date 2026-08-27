@@ -290,12 +290,16 @@ void HttpServer::ProcessEvents(int worker_id) {
       continue;
     }
 
-    EventData* data = reinterpret_cast<EventData *>(io_uring_cqe_get_data(cqe));
-    int res = cqe->res;
-    HandleURingEvent(worker_id, res, data);
-    io_uring_cqe_seen(ring, cqe);
-    // Retry draining any fds that a previous NOTIFY couldn't fit into the
-    // submission queue; submit() below just freed that space back up.
+    unsigned head;
+    unsigned count = 0;
+
+    io_uring_for_each_cqe(ring, head, cqe) {
+      EventData* data = reinterpret_cast<EventData *>(io_uring_cqe_get_data(cqe));
+      int res = cqe->res;
+      HandleURingEvent(worker_id, res, data);
+      count += 1;
+    }
+    io_uring_cq_advance(ring, count);
     HandleNotify(worker_id);
     io_uring_submit(ring);
   }
