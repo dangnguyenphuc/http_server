@@ -30,19 +30,30 @@ constexpr size_t kMaxBufferSize = 4096;
 enum class EventType {
   ACCEPT,
   NOTIFY,
-  READ, 
+  READ,
   WRITE
 };
 
-struct EventData {
-  EventData() : fd(0), length(0), cursor(0), buffer() {}
-  int fd;
+struct EventDataBase {
+  explicit EventDataBase(EventType t) : type(t) {}
   EventType type;
+};
+
+struct AcceptEvent : EventDataBase {
+  AcceptEvent() : EventDataBase(EventType::ACCEPT) {}
+};
+
+struct NotifyEvent : EventDataBase {
+  NotifyEvent() : EventDataBase(EventType::NOTIFY), notify_value(0) {}
+  uint64_t notify_value;
+};
+
+struct IoEvent : EventDataBase {
+  IoEvent() : EventDataBase(EventType::READ), fd(0), length(0), cursor(0), buffer() {}
+  int fd;
   size_t length;
   size_t cursor;
   char buffer[kMaxBufferSize];
-
-  uint64_t notify_value;
 };
 
 // A request handler should expect a request as argument and returns a response
@@ -98,23 +109,24 @@ class HttpServer {
   void ProcessEvents(int worker_id);
 
   // Helper to push new async requests to the ring
-  void SubmitAccept();
+  void SubmitAcceptMultishot();
   void DispatchConnection(int worker_id, int fd);
   void SubmitWorkerNotify(int worker_id);
-  void SubmitRecvRequest(int worker_id, EventData* data);
-  void SubmitSendRequest(int worker_id, EventData* data);
+  void SubmitRecvRequest(int worker_id, IoEvent* data);
+  void SubmitSendRequest(int worker_id, IoEvent* data);
   void HandleNotify(int worker_id);
-  void HandleRecv(int worker_id, int res, EventData* data);
-  void HandleSend(int worker_id, int res, EventData* data);
+  void HandleRecv(int worker_id, int res, IoEvent* data);
+  void HandleSend(int worker_id, int res, IoEvent* data);
 
-  void HandleURingEvent(int worker_id, int res, EventData* data);
+  void HandleURingEvent(int worker_id, int res, EventDataBase* event);
   // Returns false if it already closed/deleted `request` (e.g. oversized
   // response) — the caller must not touch it again in that case.
-  bool HandleHttpData(EventData* request);
+  bool HandleHttpData(IoEvent* request);
   HttpResponse HandleHttpRequest(const HttpRequest& request);
 
-  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, EventData* data);
-  struct io_uring_sqe* GetListenIouringSqe(EventData* data);
+  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, NotifyEvent* data);
+  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, IoEvent* data);
+  struct io_uring_sqe* GetListenIouringSqe(AcceptEvent* data);
 };
 
 }  // namespace simple_http_server

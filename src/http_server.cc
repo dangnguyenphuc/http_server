@@ -120,7 +120,7 @@ void HttpServer::Stop() {
 
 void HttpServer::Listen() {
   int current_worker = 0;
-  SubmitAccept();
+  SubmitAcceptMultishot();
   io_uring_submit(&listen_ring_);
   while (running_) {
     struct io_uring_cqe* cqe = nullptr;
@@ -135,32 +135,34 @@ void HttpServer::Listen() {
       continue;
     }
 
-    auto* data = reinterpret_cast<EventData*>(cqe->user_data);
+    // listen_ring_ only ever carries ACCEPT ops.
+    auto* data = reinterpret_cast<AcceptEvent*>(cqe->user_data);
     int result = cqe->res;
-    if (data->type == EventType::ACCEPT) {
-      if (result >= 0) {
-        int client_fd = result;
-        DispatchConnection(current_worker, client_fd);
-        current_worker = (current_worker + 1) % kThreadPoolSize;
-      } else {
-        fprintf(
-            stderr,
-            "accept: %s\n",
-            strerror(-result));
-      }
-      SubmitAccept();
+    if (result >= 0) {
+      int client_fd = result;
+      DispatchConnection(current_worker, client_fd);
+      current_worker = (current_worker + 1) % kThreadPoolSize;
+    } else {
+      fprintf(
+          stderr,
+          "accept: %s\n",
+          strerror(-result));
     }
-    delete data;
+    if (!(cqe->flags & IORING_CQE_F_MORE)) {
+      delete data;
+      if (running_) {
+        SubmitAcceptMultishot();
+      }
+    }
     io_uring_cqe_seen(&listen_ring_, cqe);
     io_uring_submit(&listen_ring_);
   }
 }
 
-void HttpServer::SubmitAccept() {
-  auto* data = new EventData();
+void HttpServer::SubmitAcceptMultishot() {
+  auto* data = new AcceptEvent();
   struct io_uring_sqe* sqe = GetListenIouringSqe(data);
-  data->type = EventType::ACCEPT;
-  io_uring_prep_accept(sqe, sock_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+  io_uring_prep_multishot_accept(sqe, sock_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
   io_uring_sqe_set_data(sqe, data);
 }
 
@@ -182,10 +184,8 @@ void HttpServer::DispatchConnection(int worker_id, int fd) {
 }
 
 void HttpServer::SubmitWorkerNotify(int worker_id) {
-  auto* data = new EventData();
+  auto* data = new NotifyEvent();
   struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
-  data->type = EventType::NOTIFY;
-  data->notify_value = 0;
 
   io_uring_prep_read(
       sqe,
@@ -194,10 +194,10 @@ void HttpServer::SubmitWorkerNotify(int worker_id) {
       sizeof(data->notify_value),
       0);
 
-    sqe->user_data = reinterpret_cast<uint64_t>(data);
+  io_uring_sqe_set_data(sqe, data);
 }
 
-void HttpServer::SubmitRecvRequest(int worker_id, EventData* data) {
+void HttpServer::SubmitRecvRequest(int worker_id, IoEvent* data) {
   struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
   // todo: here
   data->type = EventType::READ;
@@ -205,7 +205,7 @@ void HttpServer::SubmitRecvRequest(int worker_id, EventData* data) {
   io_uring_sqe_set_data(sqe, data);
 }
 
-void HttpServer::SubmitSendRequest(int worker_id, EventData* data) {
+void HttpServer::SubmitSendRequest(int worker_id, IoEvent* data) {
   struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
   // todo: here
   data->type = EventType::WRITE;
@@ -228,14 +228,14 @@ void HttpServer::HandleNotify(int worker_id) {
       pending_fds.pop_front();
     }
 
-    auto* data = new EventData();
+    auto* data = new IoEvent();
     data->fd = client_fd;
     printf("worker %d: new fd=%d\n", worker_id, client_fd);
     SubmitRecvRequest(worker_id, data);
   }
 }
 
-void HttpServer::HandleRecv(int worker_id, int res, EventData* data) {
+void HttpServer::HandleRecv(int worker_id, int res, IoEvent* data) {
   if (res <= 0) {
     close(data->fd);
     delete data;
@@ -254,7 +254,7 @@ void HttpServer::HandleRecv(int worker_id, int res, EventData* data) {
   SubmitSendRequest(worker_id, data);
 }
 
-void HttpServer::HandleSend(int worker_id, int res, EventData* data) {
+void HttpServer::HandleSend(int worker_id, int res, IoEvent* data) {
   if (res < 0) {
     close(data->fd);
     delete data;
@@ -294,9 +294,9 @@ void HttpServer::ProcessEvents(int worker_id) {
     unsigned count = 0;
 
     io_uring_for_each_cqe(ring, head, cqe) {
-      EventData* data = reinterpret_cast<EventData *>(io_uring_cqe_get_data(cqe));
+      auto* event = reinterpret_cast<EventDataBase*>(io_uring_cqe_get_data(cqe));
       int res = cqe->res;
-      HandleURingEvent(worker_id, res, data);
+      HandleURingEvent(worker_id, res, event);
       count += 1;
     }
     io_uring_cq_advance(ring, count);
@@ -305,10 +305,11 @@ void HttpServer::ProcessEvents(int worker_id) {
   }
 }
 
-void HttpServer::HandleURingEvent(int worker_id, int res, EventData *data) {
-  switch (data->type)
+void HttpServer::HandleURingEvent(int worker_id, int res, EventDataBase *event) {
+  switch (event->type)
   {
-    case EventType::NOTIFY:
+    case EventType::NOTIFY: {
+      auto* data = static_cast<NotifyEvent*>(event);
       // Re-arm the eventfd read first so it always gets a slot, even if
       // draining below fills the rest of the submission queue.
       SubmitWorkerNotify(worker_id);
@@ -317,16 +318,19 @@ void HttpServer::HandleURingEvent(int worker_id, int res, EventData *data) {
       }
       delete data;
       break;
+    }
     case EventType::READ:
-      HandleRecv(worker_id, res, data);
+      HandleRecv(worker_id, res, static_cast<IoEvent*>(event));
       break;
     case EventType::WRITE:
-      HandleSend(worker_id, res, data);
+      HandleSend(worker_id, res, static_cast<IoEvent*>(event));
+      break;
+    default:
       break;
   }
 }
 
-bool HttpServer::HandleHttpData(EventData* raw_request) {
+bool HttpServer::HandleHttpData(IoEvent* raw_request) {
   std::string request_string(raw_request->buffer), response_string;
   HttpRequest http_request;
   HttpResponse http_response;
@@ -374,7 +378,7 @@ HttpResponse HttpServer::HandleHttpRequest(const HttpRequest &request) {
   return callback_it->second(request);  // call handler to process the request
 }
 
-struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, EventData* data) {
+struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, NotifyEvent* data) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
   if (!sqe) {
     delete data;
@@ -383,7 +387,16 @@ struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, EventData* d
   return sqe;
 }
 
-struct io_uring_sqe* HttpServer::GetListenIouringSqe(EventData* data) {
+struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, IoEvent* data) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
+  if (!sqe) {
+    delete data;
+    throw std::runtime_error("Failed to get sqe of worker_ring");
+  }
+  return sqe;
+}
+
+struct io_uring_sqe* HttpServer::GetListenIouringSqe(AcceptEvent* data) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&listen_ring_);
   if (!sqe) {
     delete data;
