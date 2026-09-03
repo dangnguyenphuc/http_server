@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <iostream>
 #include <iterator>
 #include <string>
@@ -17,6 +18,15 @@ using namespace simple_http_server;
     if (!(x))                                                            \
       err++, std::cerr << __FUNCTION__ << " failed on line " << __LINE__ \
                        << std::endl;                                     \
+  }
+
+#define RUN_TEST(test_fn)                                                  \
+  {                                                                        \
+    auto start = std::chrono::steady_clock::now();                        \
+    test_fn();                                                             \
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(       \
+        std::chrono::steady_clock::now() - start).count();                \
+    std::cout << #test_fn << ": " << us << " us" << std::endl;             \
   }
 
 int err = 0;
@@ -82,16 +92,21 @@ void test_response_to_string() {
 int main(void) {
   std::cout << "Running tests..." << std::endl;
 
-  test_uri_path_to_lowercase();
-  test_method_to_string();
-  test_version_to_string();
-  test_status_code_to_string();
-  test_string_to_method();
-  test_string_to_version();
-  test_request_to_string();
-  test_response_to_string();
+  auto suite_start = std::chrono::steady_clock::now();
+
+  RUN_TEST(test_uri_path_to_lowercase);
+  RUN_TEST(test_method_to_string);
+  RUN_TEST(test_version_to_string);
+  RUN_TEST(test_status_code_to_string);
+  RUN_TEST(test_string_to_method);
+  RUN_TEST(test_string_to_version);
+  RUN_TEST(test_request_to_string);
+  RUN_TEST(test_response_to_string);
+
+  auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - suite_start).count();
 
   std::cout << "All tests have finished. There were " << err
-            << " errors in total" << std::endl;
+            << " errors in total (" << total_us << " us)" << std::endl;
   return 0;
 }
