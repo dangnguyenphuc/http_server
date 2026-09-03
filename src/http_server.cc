@@ -7,6 +7,8 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -14,8 +16,6 @@
 
 #include "http_message.h"
 #include "uri.h"
-
-#include <iostream>
 
 namespace simple_http_server {
 
@@ -230,7 +230,6 @@ void HttpServer::HandleNotify(int worker_id) {
 
     auto* data = new EventData();
     data->fd = client_fd;
-    printf("worker %d: new fd=%d\n", worker_id, client_fd);
     SubmitRecvRequest(worker_id, data);
   }
 }
@@ -243,10 +242,6 @@ void HttpServer::HandleRecv(int worker_id, int res, EventData* data) {
   }
 
   data->buffer[res] = '\0';
-  printf("worker %d fd=%d request:\n%s\n",
-      worker_id,
-      data->fd,
-      data->buffer);
 
   if (!HandleHttpData(data)) {
     return;
@@ -265,6 +260,13 @@ void HttpServer::HandleSend(int worker_id, int res, EventData* data) {
 
   if (data->cursor < data->length) {
     SubmitSendRequest(worker_id, data);
+    return;
+  }
+
+  if (data->keep_alive) {
+    // Same connection, same EventData: wait for the next request instead
+    // of tearing the connection down.
+    SubmitRecvRequest(worker_id, data);
     return;
   }
 
@@ -330,10 +332,18 @@ bool HttpServer::HandleHttpData(EventData* raw_request) {
   std::string request_string(raw_request->buffer), response_string;
   HttpRequest http_request;
   HttpResponse http_response;
+  // HTTP/1.1 defaults to persistent connections unless the client asks to
+  // close; a request we couldn't even parse gets no benefit of the doubt,
+  // since we can't trust the byte stream is still framed correctly.
+  bool keep_alive = false;
 
   try {
     http_request = string_to_request(request_string);
     http_response = HandleHttpRequest(http_request);
+    std::string connection = http_request.header("Connection");
+    std::transform(connection.begin(), connection.end(), connection.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+    keep_alive = (connection != "close");
   } catch (const std::invalid_argument &e) {
     http_response = HttpResponse(HttpStatusCode::BadRequest);
     http_response.SetContent(e.what());
@@ -345,7 +355,10 @@ bool HttpServer::HandleHttpData(EventData* raw_request) {
     http_response.SetContent(e.what());
   }
 
-  std::cout << "Received Request:" << to_string(http_request); 
+  // The response's own Connection header is what the client actually acts
+  // on, so this is the single place that decides it — overriding whatever
+  // an individual handler may have set.
+  http_response.SetHeader("Connection", keep_alive ? "keep-alive" : "close");
 
   // Set response to write to client
   response_string =
@@ -359,6 +372,7 @@ bool HttpServer::HandleHttpData(EventData* raw_request) {
   raw_request->buffer[kMaxBufferSize - 1] = '\0';
   raw_request->length = response_string.length();
   raw_request->cursor = 0;
+  raw_request->keep_alive = keep_alive;
   return true;
 }
 

@@ -35,12 +35,15 @@ enum class EventType {
 };
 
 struct EventData {
-  EventData() : fd(0), length(0), cursor(0), buffer() {}
+  EventData() : fd(0), length(0), cursor(0), buffer(), keep_alive(false) {}
   int fd;
   EventType type;
   size_t length;
   size_t cursor;
   char buffer[kMaxBufferSize];
+  // Decided per-request in HandleHttpData; HandleSend re-arms a recv on the
+  // same connection instead of closing when this is true.
+  bool keep_alive;
 
   uint64_t notify_value;
 };
