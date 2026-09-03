@@ -272,6 +272,14 @@ void HttpServer::SubmitRemainSendRequest(int worker_id, SendEvent* data) {
   io_uring_sqe_set_data(sqe, data);
 }
 
+void HttpServer::SubmitCancelRecv(int worker_id, RecvEvent* data) {
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, nullptr);
+  io_uring_prep_cancel_fd(sqe, data->fd, 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data(sqe, nullptr);
+  io_uring_submit(&worker_ring_[worker_id]);
+}
+
 void HttpServer::HandleNotify(int worker_id) {
   for (;;) {
     int client_fd = -1;
@@ -292,13 +300,21 @@ void HttpServer::HandleNotify(int worker_id) {
 void HttpServer::HandleRecv(int worker_id, int res, RecvEvent* data, uint32_t cqe_flags) {
   bool more = cqe_flags & IORING_CQE_F_MORE;
 
-  // `data` tracks a still-armed multishot recv until the kernel reports it
-  // has truly ended (more == false) — it must never be freed before that,
-  // no matter what we decide to do about the connection in the meantime.
-  // `cancelled` remembers whether we've already closed the fd from some
-  // earlier completion on this same RecvEvent, so we never close it twice
-  // (the fd number gets reused almost immediately by a new connection).
+  if (!data->recv_active) {
+    if (cqe_flags & IORING_CQE_F_BUFFER) {
+      ReturnBufferToPool(worker_id, cqe_flags >> IORING_CQE_BUFFER_SHIFT);
+    }
+    if (!more) {
+      if (data->pending_len > 0) {
+        SubmitSendRequest(worker_id, data->pending_buffer_id, data->pending_len, data->fd);
+      }
+      delete data;
+    }
+    return;
+  }
+
   if (res <= 0 || res >= static_cast<int>(kMaxBufferSize)) {
+    data->recv_active = false;
     if (!data->cancelled) {
       CloseConnection(worker_id, data->fd);
       data->cancelled = true;
@@ -311,25 +327,24 @@ void HttpServer::HandleRecv(int worker_id, int res, RecvEvent* data, uint32_t cq
 
   uint16_t buffer_id = GetBufferIdFromCqeFlags(cqe_flags, data);
   worker_buffer_pool_[worker_id][buffer_id].data[res] = '\0';
-  
-
-  // Process whatever data we got regardless of `more` — the terminating
-  // completion of a multishot chain can still carry a real, valid request.
   int len = HandleHttpData(worker_buffer_pool_[worker_id][buffer_id].data);
+
+  data->recv_active = false;
   if (!len) {
     ReturnBufferToPool(worker_id, buffer_id);
-    if (!data->cancelled) {
-      CloseConnection(worker_id, data->fd);
-      data->cancelled = true;
-    }
+    CloseConnection(worker_id, data->fd);
+    data->cancelled = true;
   } else {
-    // Closing this connection is now the SendEvent's responsibility; the
-    // still-armed recv must not close it again when it eventually ends.
-    SubmitSendRequest(worker_id, buffer_id, len, data->fd);
+    data->pending_buffer_id = buffer_id;
+    data->pending_len = len;
+    SubmitCancelRecv(worker_id, data);
     data->cancelled = true;
   }
 
   if (!more) {
+    if (data->pending_len > 0) {
+      SubmitSendRequest(worker_id, data->pending_buffer_id, data->pending_len, data->fd);
+    }
     delete data;
   }
 }
@@ -463,14 +478,6 @@ HttpResponse HttpServer::HandleHttpRequest(const HttpRequest &request) {
 
 void HttpServer::CloseConnection(int worker_id, int fd) {
   shutdown(fd, SHUT_RDWR);
-
-  // Cancel by fd, not by the RecvEvent pointer: SendEvent and RecvEvent
-  // don't reference each other, so this is the only handle HandleSend has
-  // on the recv it needs to retire. Submit it right now, synchronously —
-  // if this just sat in the local SQE buffer until the batched submit at
-  // the end of the event loop, close() below could free the fd number for
-  // reuse by a brand-new connection before the cancel ever reaches the
-  // kernel, and it would target the wrong connection.
   struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, nullptr);
   io_uring_prep_cancel_fd(sqe, fd, 0);
   io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
@@ -516,9 +523,6 @@ void HttpServer::ReturnBufferToPool(int worker_id, int buffer_id) {
       1,
       static_cast<uint16_t>(worker_id),
       buffer_id);
-  // Fire-and-forget: skip the CQE on success so ProcessEvents never has to
-  // dispatch it; a failure (should never happen) still posts one with
-  // user_data == nullptr, which ProcessEvents logs instead of dispatching.
   io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
   io_uring_sqe_set_data(sqe, nullptr);
 }

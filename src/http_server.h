@@ -51,10 +51,16 @@ struct NotifyEvent : EventDataBase {
 };
 
 struct RecvEvent : EventDataBase {
-  RecvEvent() : EventDataBase(EventType::RECV), fd(0), cancelled(false), recv_active(true) {}
+  RecvEvent() : EventDataBase(EventType::RECV), fd(0), cancelled(false),
+      recv_active(true), pending_buffer_id(0), pending_len(0) {}
   int fd;
   bool cancelled;
   bool recv_active;
+  // Set once a complete response is ready but the recv hasn't yet been
+  // confirmed retired; consumed (pending_len reset implicitly by sending)
+  // once `!more` is finally observed.
+  uint16_t pending_buffer_id;
+  int pending_len;
 };
 
 struct SendEvent : EventDataBase {
@@ -147,7 +153,9 @@ class HttpServer {
   // recv's kernel-side tracking right away too, instead of leaving it to
   // shutdown()'s side effect. Takes worker_id because the cancel SQE must
   // be submitted (not just queued) before close() runs, so the fd can't be
-  // reused by a new connection out from under a still-pending cancel.
+  // reused by a new connection out from under a still-pending cancel. Use
+  // this only when no response is coming — otherwise use SubmitCancelRecv,
+  // which retires the recv without touching the socket itself.
   void CloseConnection(int worker_id, int fd);
 
   struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, EventDataBase* data);
