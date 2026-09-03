@@ -26,16 +26,18 @@ namespace simple_http_server {
 // Maximum size of an HTTP message is limited by how much bytes
 // we can read or send via socket each time
 constexpr size_t kMaxBufferSize = 4096;
+constexpr size_t kMaxBufferPoolSize = 512;
 
 enum class EventType {
   ACCEPT,
   NOTIFY,
-  READ,
-  WRITE
+  RECV,
+  SEND
 };
 
 struct EventDataBase {
   explicit EventDataBase(EventType t) : type(t) {}
+  virtual ~EventDataBase() = default;
   EventType type;
 };
 
@@ -48,12 +50,23 @@ struct NotifyEvent : EventDataBase {
   uint64_t notify_value;
 };
 
-struct IoEvent : EventDataBase {
-  IoEvent() : EventDataBase(EventType::READ), fd(0), length(0), cursor(0), buffer() {}
+struct RecvEvent : EventDataBase {
+  RecvEvent() : EventDataBase(EventType::RECV), fd(0), cancelled(false), recv_active(true) {}
+  int fd;
+  bool cancelled;
+  bool recv_active;
+};
+
+struct SendEvent : EventDataBase {
+  SendEvent() : EventDataBase(EventType::SEND), fd(0), length(0), cursor(0), buffer_id(0) {}
   int fd;
   size_t length;
   size_t cursor;
-  char buffer[kMaxBufferSize];
+  uint16_t buffer_id;
+};
+
+struct ProvidedBuffer {
+  char data[kMaxBufferSize];
 };
 
 // A request handler should expect a request as argument and returns a response
@@ -100,6 +113,7 @@ class HttpServer {
   std::mutex worker_mutex_[kThreadPoolSize];
   std::vector<std::deque<int>> worker_pending_fds_;
   std::vector<int> worker_event_fd_;
+  std::vector<std::vector<ProvidedBuffer>> worker_buffer_pool_;
 
   std::map<Uri, std::map<HttpMethod, HttpRequestHandler_t>> request_handlers_;
 
@@ -112,21 +126,42 @@ class HttpServer {
   void SubmitAcceptMultishot();
   void DispatchConnection(int worker_id, int fd);
   void SubmitWorkerNotify(int worker_id);
-  void SubmitRecvRequest(int worker_id, IoEvent* data);
-  void SubmitSendRequest(int worker_id, IoEvent* data);
+  void SubmitRecvRequestMultishot(int worker_id, int client_fd);
+  void SubmitSendRequest(int worker_id, uint16_t buffer_id, int len, int client_fd);
+  void SubmitRemainSendRequest(int worker_id, SendEvent* data);
+  void SubmitCancelRecv(int worker_id, RecvEvent* data);
   void HandleNotify(int worker_id);
-  void HandleRecv(int worker_id, int res, IoEvent* data);
-  void HandleSend(int worker_id, int res, IoEvent* data);
+  void HandleRecv(int worker_id, int res, RecvEvent* data, uint32_t cqe_flags);
+  void HandleSend(int worker_id, int res, SendEvent* data);
 
-  void HandleURingEvent(int worker_id, int res, EventDataBase* event);
-  // Returns false if it already closed/deleted `request` (e.g. oversized
-  // response) — the caller must not touch it again in that case.
-  bool HandleHttpData(IoEvent* request);
+  void HandleURingEvent(int worker_id, EventDataBase* event, int res, uint32_t cqe_flags);
+  // Builds the response in place into `buffer` and returns its length, or 0
+  // if the response was too large to fit (the caller must close/free then).
+  int HandleHttpData(char* buffer);
   HttpResponse HandleHttpRequest(const HttpRequest& request);
 
-  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, NotifyEvent* data);
-  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, IoEvent* data);
+  // A still-armed multishot recv holds its own kernel-side reference to the
+  // socket, so close() alone won't make the peer see it close, nor free
+  // that reference. shutdown() forces the connection down immediately
+  // regardless of that reference; the explicit ASYNC_CANCEL retires the
+  // recv's kernel-side tracking right away too, instead of leaving it to
+  // shutdown()'s side effect. Takes worker_id because the cancel SQE must
+  // be submitted (not just queued) before close() runs, so the fd can't be
+  // reused by a new connection out from under a still-pending cancel.
+  void CloseConnection(int worker_id, int fd);
+
+  struct io_uring_sqe* GetWorkerIouringSqe(int worker_id, EventDataBase* data);
   struct io_uring_sqe* GetListenIouringSqe(AcceptEvent* data);
+
+  // Buffer Pool
+  void InitBufferPool(int worker_id);
+  void ProvideBufferToIouring(int worker_id);
+  void InitWorkerBuffers(int worker_id);
+  uint16_t GetBufferIdFromCqeFlags(uint32_t cqe_flags, RecvEvent* recvEvent);
+  // Fire-and-forget: hands buffer_id back to the kernel's pool for worker_id
+  // so it can be selected again by a future recv.
+  void ReturnBufferToPool(int worker_id, int buffer_id);
+
 };
 
 }  // namespace simple_http_server

@@ -26,6 +26,7 @@ HttpServer::HttpServer(const std::string &host, std::uint16_t port)
       running_(false),
       worker_ring_() {
   CreateSocket();
+  worker_buffer_pool_.resize(kThreadPoolSize);
   worker_event_fd_.resize(kThreadPoolSize);
   worker_pending_fds_.resize(kThreadPoolSize);
   std::fill(worker_event_fd_.begin(), worker_event_fd_.end(), -1);
@@ -75,6 +76,44 @@ void HttpServer::CreateSocket() {
     }
 }
 
+void HttpServer::InitBufferPool(int worker_id) {
+  // resize() value-initializes new elements, which zeros ProvidedBuffer::data.
+  worker_buffer_pool_[worker_id].resize(kMaxBufferPoolSize);
+}
+
+void HttpServer::ProvideBufferToIouring(int worker_id) {
+  auto& buffers = worker_buffer_pool_[worker_id];
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, nullptr);
+  io_uring_prep_provide_buffers(
+    sqe,
+    buffers[0].data,
+    kMaxBufferSize,
+    static_cast<int>(buffers.size()),
+    static_cast<uint16_t>(worker_id),
+    0
+  );
+  io_uring_sqe_set_data(sqe, nullptr);
+}
+
+void HttpServer::InitWorkerBuffers(int worker_id) {
+  ProvideBufferToIouring(worker_id);
+  io_uring_submit(&worker_ring_[worker_id]);
+  struct io_uring_cqe* cqe = nullptr;
+  int ret = io_uring_wait_cqe(&worker_ring_[worker_id], &cqe);
+
+  if(ret < 0) {
+    throw std::runtime_error("Failed waiting for provide buffers");
+  }
+
+  if (cqe->res < 0) {
+    int err = -cqe->res;
+    io_uring_cqe_seen(&worker_ring_[worker_id], cqe);
+    throw std::runtime_error(std::string("provide buffers failed: ") + strerror(err));
+  }
+
+  io_uring_cqe_seen(&worker_ring_[worker_id], cqe);
+}
+
 void HttpServer::SetUpRings() {
   if (io_uring_queue_init(kQueueDepth, &listen_ring_, 0) < 0) {
       throw std::runtime_error("Failed to initialize io_uring for worker");
@@ -83,6 +122,9 @@ void HttpServer::SetUpRings() {
     if (io_uring_queue_init(kQueueDepth, &worker_ring_[i], 0) < 0) {
       throw std::runtime_error("Failed to initialize io_uring for worker");
     }
+
+    InitBufferPool(i);
+    InitWorkerBuffers(i);
 
     worker_event_fd_[i] = eventfd(0, EFD_CLOEXEC);
     if (worker_event_fd_[i] < 0) {
@@ -185,7 +227,7 @@ void HttpServer::DispatchConnection(int worker_id, int fd) {
 
 void HttpServer::SubmitWorkerNotify(int worker_id) {
   auto* data = new NotifyEvent();
-  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, static_cast<EventDataBase*>(data));
 
   io_uring_prep_read(
       sqe,
@@ -197,20 +239,36 @@ void HttpServer::SubmitWorkerNotify(int worker_id) {
   io_uring_sqe_set_data(sqe, data);
 }
 
-void HttpServer::SubmitRecvRequest(int worker_id, IoEvent* data) {
-  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
+void HttpServer::SubmitRecvRequestMultishot(int worker_id, int client_fd) {
+  RecvEvent* data = new RecvEvent();
+  data->fd = client_fd;
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, static_cast<EventDataBase*>(data));
   // todo: here
-  data->type = EventType::READ;
-  io_uring_prep_recv(sqe, data->fd, data->buffer, kMaxBufferSize - 1, 0);
+  data->type = EventType::RECV;
+  io_uring_prep_recv_multishot(sqe, data->fd, nullptr, 0, 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_BUFFER_SELECT);
+  io_uring_sqe_set_buf_group(sqe, static_cast<uint16_t>(worker_id));
   io_uring_sqe_set_data(sqe, data);
 }
 
-void HttpServer::SubmitSendRequest(int worker_id, IoEvent* data) {
-  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, data);
-  // todo: here
-  data->type = EventType::WRITE;
+void HttpServer::SubmitSendRequest(int worker_id, uint16_t buffer_id, int len, int client_fd) {
+  SendEvent* data = new SendEvent();
+  data->buffer_id = buffer_id;
+  data->fd = client_fd;
+  data->length = len;
+  data->type = EventType::SEND;
+  auto& buffer = worker_buffer_pool_[worker_id][buffer_id].data;
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, static_cast<EventDataBase*>(data));
   size_t remaining = data->length - data->cursor;
-  io_uring_prep_send(sqe, data->fd, data->buffer + data->cursor, remaining, 0);
+  io_uring_prep_send(sqe, data->fd, buffer + data->cursor, remaining, 0);
+  io_uring_sqe_set_data(sqe, data);
+}
+
+void HttpServer::SubmitRemainSendRequest(int worker_id, SendEvent* data) {
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, static_cast<EventDataBase*>(data));
+  size_t remaining = data->length - data->cursor;
+  auto& buffer = worker_buffer_pool_[worker_id][data->buffer_id].data;
+  io_uring_prep_send(sqe, data->fd, buffer + data->cursor, remaining, 0);
   io_uring_sqe_set_data(sqe, data);
 }
 
@@ -227,36 +285,59 @@ void HttpServer::HandleNotify(int worker_id) {
       client_fd = pending_fds.front();
       pending_fds.pop_front();
     }
-
-    auto* data = new IoEvent();
-    data->fd = client_fd;
-    printf("worker %d: new fd=%d\n", worker_id, client_fd);
-    SubmitRecvRequest(worker_id, data);
+    SubmitRecvRequestMultishot(worker_id, client_fd);
   }
 }
 
-void HttpServer::HandleRecv(int worker_id, int res, IoEvent* data) {
-  if (res <= 0) {
-    close(data->fd);
+void HttpServer::HandleRecv(int worker_id, int res, RecvEvent* data, uint32_t cqe_flags) {
+  bool more = cqe_flags & IORING_CQE_F_MORE;
+
+  // `data` tracks a still-armed multishot recv until the kernel reports it
+  // has truly ended (more == false) — it must never be freed before that,
+  // no matter what we decide to do about the connection in the meantime.
+  // `cancelled` remembers whether we've already closed the fd from some
+  // earlier completion on this same RecvEvent, so we never close it twice
+  // (the fd number gets reused almost immediately by a new connection).
+  if (res <= 0 || res >= static_cast<int>(kMaxBufferSize)) {
+    if (!data->cancelled) {
+      CloseConnection(worker_id, data->fd);
+      data->cancelled = true;
+    }
+    if (!more) {
+      delete data;
+    }
+    return;
+  }
+
+  uint16_t buffer_id = GetBufferIdFromCqeFlags(cqe_flags, data);
+  worker_buffer_pool_[worker_id][buffer_id].data[res] = '\0';
+  
+
+  // Process whatever data we got regardless of `more` — the terminating
+  // completion of a multishot chain can still carry a real, valid request.
+  int len = HandleHttpData(worker_buffer_pool_[worker_id][buffer_id].data);
+  if (!len) {
+    ReturnBufferToPool(worker_id, buffer_id);
+    if (!data->cancelled) {
+      CloseConnection(worker_id, data->fd);
+      data->cancelled = true;
+    }
+  } else {
+    // Closing this connection is now the SendEvent's responsibility; the
+    // still-armed recv must not close it again when it eventually ends.
+    SubmitSendRequest(worker_id, buffer_id, len, data->fd);
+    data->cancelled = true;
+  }
+
+  if (!more) {
     delete data;
-    return;
   }
-
-  data->buffer[res] = '\0';
-  printf("worker %d fd=%d request:\n%s\n",
-      worker_id,
-      data->fd,
-      data->buffer);
-
-  if (!HandleHttpData(data)) {
-    return;
-  }
-  SubmitSendRequest(worker_id, data);
 }
 
-void HttpServer::HandleSend(int worker_id, int res, IoEvent* data) {
+void HttpServer::HandleSend(int worker_id, int res, SendEvent* data) {
   if (res < 0) {
-    close(data->fd);
+    CloseConnection(worker_id, data->fd);
+    ReturnBufferToPool(worker_id, data->buffer_id);
     delete data;
     return;
   }
@@ -264,11 +345,11 @@ void HttpServer::HandleSend(int worker_id, int res, IoEvent* data) {
   data->cursor += static_cast<size_t>(res);
 
   if (data->cursor < data->length) {
-    SubmitSendRequest(worker_id, data);
+    SubmitRemainSendRequest(worker_id, data);
     return;
   }
-
-  close(data->fd);
+  ReturnBufferToPool(worker_id, data->buffer_id);
+  CloseConnection(worker_id, data->fd);
   delete data;
 }
 
@@ -296,7 +377,12 @@ void HttpServer::ProcessEvents(int worker_id) {
     io_uring_for_each_cqe(ring, head, cqe) {
       auto* event = reinterpret_cast<EventDataBase*>(io_uring_cqe_get_data(cqe));
       int res = cqe->res;
-      HandleURingEvent(worker_id, res, event);
+      if (event) {
+        HandleURingEvent(worker_id, event, res, cqe->flags);
+      } else if (res < 0) {
+        // A fire-and-forget op (e.g. ReturnBufferToPool) failed.
+        fprintf(stderr, "worker %d: untracked op failed: %s\n", worker_id, strerror(-res));
+      }
       count += 1;
     }
     io_uring_cq_advance(ring, count);
@@ -305,7 +391,7 @@ void HttpServer::ProcessEvents(int worker_id) {
   }
 }
 
-void HttpServer::HandleURingEvent(int worker_id, int res, EventDataBase *event) {
+void HttpServer::HandleURingEvent(int worker_id, EventDataBase *event, int res, uint32_t cqe_flags) {
   switch (event->type)
   {
     case EventType::NOTIFY: {
@@ -319,19 +405,19 @@ void HttpServer::HandleURingEvent(int worker_id, int res, EventDataBase *event) 
       delete data;
       break;
     }
-    case EventType::READ:
-      HandleRecv(worker_id, res, static_cast<IoEvent*>(event));
+    case EventType::RECV:
+      HandleRecv(worker_id, res, static_cast<RecvEvent*>(event), cqe_flags);
       break;
-    case EventType::WRITE:
-      HandleSend(worker_id, res, static_cast<IoEvent*>(event));
+    case EventType::SEND:
+      HandleSend(worker_id, res, static_cast<SendEvent*>(event));
       break;
     default:
       break;
   }
 }
 
-bool HttpServer::HandleHttpData(IoEvent* raw_request) {
-  std::string request_string(raw_request->buffer), response_string;
+int HttpServer::HandleHttpData(char* buffer) {
+  std::string request_string(buffer), response_string;
   HttpRequest http_request;
   HttpResponse http_response;
 
@@ -355,15 +441,12 @@ bool HttpServer::HandleHttpData(IoEvent* raw_request) {
   response_string =
       to_string(http_response, http_request.method() != HttpMethod::HEAD);
   if (response_string.size() >= kMaxBufferSize) {
-    close(raw_request->fd);
-    delete raw_request;
-    return false;
+    fprintf(stderr, "Invalid response string: %s", response_string.c_str());
+    return 0;
   }
-  std::strncpy(raw_request->buffer, response_string.c_str(), sizeof(char)*kMaxBufferSize - 1);
-  raw_request->buffer[kMaxBufferSize - 1] = '\0';
-  raw_request->length = response_string.length();
-  raw_request->cursor = 0;
-  return true;
+  std::strncpy(buffer, response_string.c_str(), sizeof(char)*kMaxBufferSize - 1);
+  buffer[kMaxBufferSize - 1] = '\0';
+  return response_string.length();
 }
 
 HttpResponse HttpServer::HandleHttpRequest(const HttpRequest &request) {
@@ -378,19 +461,29 @@ HttpResponse HttpServer::HandleHttpRequest(const HttpRequest &request) {
   return callback_it->second(request);  // call handler to process the request
 }
 
-struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, NotifyEvent* data) {
-  struct io_uring_sqe *sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
-  if (!sqe) {
-    delete data;
-    throw std::runtime_error("Failed to get sqe of worker_ring");
-  }
-  return sqe;
+void HttpServer::CloseConnection(int worker_id, int fd) {
+  shutdown(fd, SHUT_RDWR);
+
+  // Cancel by fd, not by the RecvEvent pointer: SendEvent and RecvEvent
+  // don't reference each other, so this is the only handle HandleSend has
+  // on the recv it needs to retire. Submit it right now, synchronously —
+  // if this just sat in the local SQE buffer until the batched submit at
+  // the end of the event loop, close() below could free the fd number for
+  // reuse by a brand-new connection before the cancel ever reaches the
+  // kernel, and it would target the wrong connection.
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, nullptr);
+  io_uring_prep_cancel_fd(sqe, fd, 0);
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data(sqe, nullptr);
+  io_uring_submit(&worker_ring_[worker_id]);
+
+  close(fd);
 }
 
-struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, IoEvent* data) {
+struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, EventDataBase* data) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&worker_ring_[worker_id]);
   if (!sqe) {
-    delete data;
+    if (data) delete data;
     throw std::runtime_error("Failed to get sqe of worker_ring");
   }
   return sqe;
@@ -399,10 +492,35 @@ struct io_uring_sqe* HttpServer::GetWorkerIouringSqe(int worker_id, IoEvent* dat
 struct io_uring_sqe* HttpServer::GetListenIouringSqe(AcceptEvent* data) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&listen_ring_);
   if (!sqe) {
-    delete data;
+    if (data) delete data;
     throw std::runtime_error("Failed to get sqe of listen_ring");
   }
   return sqe;
+}
+
+uint16_t HttpServer::GetBufferIdFromCqeFlags(uint32_t cqe_flags, RecvEvent* recvEvent) {
+  if (!(cqe_flags & IORING_CQE_F_BUFFER)) {
+    close(recvEvent->fd);
+    delete recvEvent;
+    throw std::runtime_error("Worker CQE did not select a provided buffer");
+  }
+  return cqe_flags >> IORING_CQE_BUFFER_SHIFT;
+}
+
+void HttpServer::ReturnBufferToPool(int worker_id, int buffer_id) {
+  struct io_uring_sqe* sqe = GetWorkerIouringSqe(worker_id, nullptr);
+  io_uring_prep_provide_buffers(
+      sqe,
+      worker_buffer_pool_[worker_id][buffer_id].data,
+      kMaxBufferSize,
+      1,
+      static_cast<uint16_t>(worker_id),
+      buffer_id);
+  // Fire-and-forget: skip the CQE on success so ProcessEvents never has to
+  // dispatch it; a failure (should never happen) still posts one with
+  // user_data == nullptr, which ProcessEvents logs instead of dispatching.
+  io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+  io_uring_sqe_set_data(sqe, nullptr);
 }
 
 }  // namespace simple_http_server
